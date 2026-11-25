@@ -490,13 +490,17 @@ impl Decoder {
     /// Decodes one frame (`frame.data`, `frame.bits`) and appends
     /// `FRAME_SAMPLES` interleaved samples per channel to `out`.
     pub fn decode(&mut self, data: &[u8], bits: usize, out: &mut Vec<i16>) -> Result<(), Error> {
-        let mut b = Bits {
-            data,
-            pos: 0,
-            end: bits,
+        let result = if bits > data.len().saturating_mul(8) {
+            Err(Error("frame truncated"))
+        } else {
+            let mut b = Bits {
+                data,
+                pos: 0,
+                end: bits,
+            };
+            let len = b.read(LENGTH_BITS) as usize;
+            self.frame(&mut b, len)
         };
-        let len = b.read(LENGTH_BITS) as usize;
-        let result = self.frame(&mut b, len);
         if result.is_err() {
             // Whatever the frame held is lost; keep the stream's timing.
             for c in 0..self.channels {
@@ -588,6 +592,9 @@ impl Decoder {
                         || channels_for_cur_subframe == 1
                         || min_channel_len == FRAME_SAMPLES - MIN_SUBFRAME
                         || b.bit());
+            }
+            if !contains[..self.channels].iter().any(|&c| c) {
+                return Err(Error("empty subframe"));
             }
             let subframe_len = self.subframe_length(b, min_channel_len)?;
             min_channel_len += subframe_len;
@@ -766,7 +773,7 @@ impl Decoder {
                     ch.scale_factor_step = b.read(2) as i32 + 1;
                     let mut val = 45 / ch.scale_factor_step;
                     for band in 0..self.num_bands {
-                        val += codes.scale.read(b);
+                        val = val.saturating_add(codes.scale.read(b));
                         ch.saved_scale_factors[target][band] = val;
                     }
                 } else {
@@ -789,13 +796,21 @@ impl Decoder {
                         if band >= self.num_bands {
                             return Err(Error("scale factor run"));
                         }
-                        ch.saved_scale_factors[target][band] += if negative { -val } else { val };
+                        let delta = if negative { -val } else { val };
+                        ch.saved_scale_factors[target][band] =
+                            ch.saved_scale_factors[target][band].saturating_add(delta);
                         band += 1;
                     }
+                }
+                if b.overread() {
+                    return Err(Error("scale factors"));
                 }
                 ch.scale_factor_idx = target;
                 ch.table_idx = self.table_idx;
                 ch.reuse_sf = true;
+            }
+            if !ch.reuse_sf {
+                return Err(Error("missing scale factors"));
             }
             let sf = &ch.saved_scale_factors[ch.scale_factors][..self.num_bands];
             ch.max_scale_factor = sf.iter().copied().max().unwrap_or(0);
@@ -877,20 +892,27 @@ impl Decoder {
                 }
             }
             // Quantisation step (16-bit samples: 90 * 16 >> 4).
-            let mut quant_step = 90;
-            let mut step = b.signed(6);
+            let mut quant_step = 90i32;
+            let step = b.signed(6);
             quant_step += step;
             if step == -32 || step == 31 {
                 let negative = step == -32;
-                let mut quant = 0;
-                while b.pos + 5 < b.end {
-                    step = b.read(5) as i32;
-                    if step != 31 {
+                let mut quant = 0i32;
+                loop {
+                    if b.pos + 5 > b.end {
+                        return Err(Error("quantisation step"));
+                    }
+                    let extra = b.read(5) as i32;
+                    quant = quant.saturating_add(extra);
+                    if extra != 31 {
                         break;
                     }
-                    quant += 31;
                 }
-                quant_step += if negative { -(quant + step) } else { quant + step };
+                quant_step = if negative {
+                    quant_step.saturating_sub(quant)
+                } else {
+                    quant_step.saturating_add(quant)
+                };
             }
             if self.channels_for_cur_subframe == 1 {
                 self.ch[self.channel_indexes[0]].quant_step = quant_step;
@@ -900,11 +922,12 @@ impl Decoder {
                     let c = self.channel_indexes[i];
                     self.ch[c].quant_step = quant_step;
                     if b.bit() {
-                        self.ch[c].quant_step += if modifier_len > 0 {
+                        let delta = if modifier_len > 0 {
                             b.read(modifier_len) as i32 + 1
                         } else {
                             1
                         };
+                        self.ch[c].quant_step = self.ch[c].quant_step.saturating_add(delta);
                     }
                 }
             }
@@ -933,7 +956,10 @@ impl Decoder {
                 let sf = ch.saved_scale_factors[ch.scale_factors];
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
-                    let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
+                    let diff = ch.max_scale_factor.saturating_sub(sf[band]);
+                    let exp = ch
+                        .quant_step
+                        .saturating_sub(diff.saturating_mul(ch.scale_factor_step));
                     let quant = 10f32.powf(exp as f32 / 20.0);
                     for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
                         *t = c * quant;
@@ -1151,6 +1177,111 @@ mod tests {
         assert_eq!(c.bits, 60);
         // C was packet 1's only frame: the next would be in packet 2.
         assert_eq!(c.next, None);
+    }
+
+    #[test]
+    fn tile_header_rejects_empty_subframe_without_spinning() {
+        let mut decoder = Decoder::new(2, 48_000);
+        // fixed=0, contains[0]=0, contains[1]=0, followed by plenty of zero bits.
+        let data = [0u8; 64];
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+        assert_eq!(decoder.tile_header(&mut b), Err(Error("empty subframe")));
+        assert_eq!(b.consumed(), 3);
+    }
+
+    #[test]
+    fn scale_factors_rejects_reuse_without_prior_factors_after_silent_subframe() {
+        let mut decoder = Decoder::new(1, 48_000);
+        decoder.channels_for_cur_subframe = 1;
+        decoder.channel_indexes = [0, 1];
+        decoder.table_idx = 1;
+        decoder.num_bands = decoder.num_sfb[1];
+        // Subframe 0 was silent (`reuse_sf` stayed false), now at subframe 1
+        // with reuse bit = 0 ("reuse previous scale factors").
+        decoder.ch[0].cur_subframe = 1;
+        decoder.ch[0].reuse_sf = false;
+        let data = [0u8; 8];
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end: 64,
+        };
+        assert_eq!(
+            decoder.scale_factors(&mut b),
+            Err(Error("missing scale factors"))
+        );
+    }
+
+    #[test]
+    fn quant_step_escape_rejects_truncation_and_reads_exact_tail() {
+        // Mono subframe with transmit_coefs=1, transmit_num_vec_coeffs=0,
+        // quant_step signed 6-bit = -32 (0b10_0000), followed by a 5-bit escape.
+        let make_subframe = |tail_bits: usize, escape: u32| {
+            let mut dec = Decoder::new(1, 48_000);
+            dec.ch[0].num_subframes = 1;
+            dec.ch[0].subframe_len[0] = FRAME_SAMPLES;
+            let mut data = [0u8; 16];
+            let mut pos = 0usize;
+            // ext_header=0, reserved=0, transmit_coefs=1, transmit_num_vec_coeffs=0
+            put_bits(&mut data, pos, 4, 0b0010);
+            pos += 4;
+            // 6-bit signed step = -32 (0x20)
+            put_bits(&mut data, pos, 6, 0x20);
+            pos += 6;
+            if tail_bits >= 5 {
+                put_bits(&mut data, pos, 5, escape);
+            }
+            let end = pos + tail_bits;
+            (dec, data, end)
+        };
+
+        // 1) Truncated right before the 5-bit escape (4 bits left): must fail
+        //    with `quantisation step`, not add `+32` from the stale `-32`.
+        let (mut dec, data, end) = make_subframe(4, 0);
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end,
+        };
+        assert_eq!(dec.subframe(&mut b), Err(Error("quantisation step")));
+
+        // 2) Truncated non-terminating escape (all 1s = 31, then EOF): must fail.
+        let (mut dec, data, end) = make_subframe(5, 31);
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end,
+        };
+        assert_eq!(dec.subframe(&mut b), Err(Error("quantisation step")));
+
+        // 3) Exactly 5 bits left with terminating escape `10`: must consume the
+        //    5-bit escape (`quant_step = 90 - 32 - 10 = 48`) and then fail in
+        //    `scale_factors` (not `quantisation step`).
+        let (mut dec, data, end) = make_subframe(5, 10);
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end,
+        };
+        assert_eq!(dec.subframe(&mut b), Err(Error("scale factors")));
+        assert_eq!(dec.ch[0].quant_step, 48);
+    }
+
+    #[test]
+    fn decode_rejects_bit_length_past_buffer_and_keeps_timing() {
+        let mut dec = Decoder::new(2, 48_000);
+        let mut out = Vec::new();
+        let data = [0u8; 4];
+        assert_eq!(
+            dec.decode(&data, 33, &mut out),
+            Err(Error("frame truncated"))
+        );
+        assert_eq!(out.len(), FRAME_SAMPLES * 2);
+        assert!(out.iter().all(|&s| s == 0));
     }
 
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of
