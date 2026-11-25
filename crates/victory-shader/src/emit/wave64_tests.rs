@@ -8,6 +8,8 @@
 
 use std::collections::HashSet;
 
+use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1};
+
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -281,7 +283,13 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
 /// The console's 16-bit wave sum where the lanes at or past s0 have left the program (a
 /// thread past the end of the data): on the console they add +0, and after each step of the
 /// tree they hold their run's partial sum all the same. On a host of 64-lane waves (AMD) the
-/// lanes that are here read each partner run's sum from a lane of it that is here.
+/// lanes that are here read each partner run's sum from a lane of it that is here. On a host
+/// of 32-lane waves (NVIDIA) the program runs in the paired form.
+///
+/// The device is asked how wide its waves are before the form is chosen ([`card`]), and it
+/// must then take that form and run it: a refused pipeline fails the test there, where
+/// before the 64-lane form was refused by a 32-lane device and the test passed with nothing
+/// run on the card.
 #[test]
 fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     let mut words = vec![
@@ -327,7 +335,20 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     };
     let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = false;
+    let Some((host, lanes)) = card() else {
+        return;
+    };
+    // The console's own 64 lanes where the device's waves hold them; on waves of 32, the
+    // paired form (lowered for such a host and validated by `paired`); neither form runs on
+    // narrower waves (the software adapter's are 4).
+    let shader = match lanes {
+        64.. => shader,
+        32..=63 => paired(&native),
+        _ => {
+            eprintln!("the hardware device's waves hold at most {lanes} lanes; not run");
+            return;
+        }
+    };
     for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
         let terms: Vec<u16> = (0..64u32)
             .map(|t| if t < stay { (0x3C00 + 37 * t) as u16 } else { 0 })
@@ -336,16 +357,12 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         while tree.len() > 1 {
             tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
         }
-        let Some(got) = on_the_card(&shader, [stay, 0]) else {
-            return;
-        };
-        ran = true;
+        let got = run_on(&host, &shader, [stay, 0])
+            .unwrap_or_else(|e| panic!("the hardware device (waves of at most {lanes} lanes) refused the form chosen for it: {e}"));
         // (the high half is lane 0's term's: zero)
         assert_eq!(got, u32::from(tree[0]), "{stay} lanes stay: got {got:#x}, the console's tree {:#x}", tree[0]);
     }
-    if ran {
-        eprintln!("ran on the hardware device: the console's tree with lanes gone, in every case");
-    }
+    eprintln!("ran on the hardware device (waves of at most {lanes} lanes): the console's tree with lanes gone, in every case");
 }
 
 /// One `v_add_f16` whose exact result lies between two halves: 1 + 3/1024 (0x3C03) plus 2
@@ -493,10 +510,40 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
     };
-    let Ok((root, pso)) = host.compute_pipeline(shader) else {
+    let Ok(got) = run_on(&host, shader, constants) else {
         eprintln!("the hardware device does not take this program; not run");
         return None;
     };
+    Some(got)
+}
+
+/// The hardware device and the most lanes its waves hold (`WaveLaneCountMax` of its
+/// `D3D12_OPTIONS1`): 64 on a GPU that runs the console's wave64 programs as they are, 32
+/// where they need the paired form. None (and a line) without an SM 6.6 hardware device.
+fn card() -> Option<(Host, u32)> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a plain query into a struct of the size given.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    if let Err(e) = asked {
+        eprintln!("the hardware device does not say how wide its waves are: {e}; not run");
+        return None;
+    }
+    Some((host, options.WaveLaneCountMax))
+}
+
+/// [`on_the_card`] on the device `host`: an error if it does not take the program.
+fn run_on(host: &Host, shader: &HostShader, constants: [u32; 2]) -> Result<u32, String> {
+    let (root, pso) = host.compute_pipeline(shader)?;
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
         if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
@@ -515,7 +562,7 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
             },
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
-    Some(out[0][0])
+    Ok(out[0][0])
 }
 
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
