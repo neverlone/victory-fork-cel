@@ -585,22 +585,44 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
+            ("v_permlanex16_b32", Some(a))
+                if matches!(v.opsel, 0 | 1 | 9)
+                    && v.dpp.is_none()
+                    && matches!(v.src.first(), Some(Operand::Vector { .. })) =>
+            {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
+                let fetch_inactive = v.opsel & 1 != 0;
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) => {
+                    // The console compiler also sets reserved bit 3 for the
+                    // Wave32 prefix idiom: upper row reads lane 15 by FI.
+                    // Allow that encoding only with the observed lane mask and selectors.
+                    (Some(s1), Some(s2))
+                        if v.opsel != 9
+                            || (wave, exec, s1, s2) == (32, 0xffff_0000, u32::MAX, u32::MAX) =>
+                    {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
                                 let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let source = other | pick;
+                                let value = a[source as usize];
+                                // FI reads the preceding register value even with source EXEC
+                                // clear. An external lane's opaque VGPR is still unavailable:
+                                // treating it as Own would attribute it to the destination lane.
+                                if (fetch_inactive || exec >> source & 1 != 0)
+                                    && !matches!(value, Sym::Own(_))
+                                {
+                                    value
+                                } else {
+                                    Sym::Unknown
+                                }
                             })
                             .collect()
                     }
@@ -920,6 +942,49 @@ mod tests {
             fi: false,
         };
         assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
+    }
+
+    #[test]
+    fn opposite_row_fetch_inactive_finishes_a_wave32_prefix() {
+        for (controls, recognized) in [(1, true), (9, true), (0, false), (5, false)] {
+            let mut words = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
+            words.extend(vop3(1, 0x101, 128, 256, 0)); // v1 = saved_exec ? v0 : 0
+            words.push(vop1(2, 0x01, 257));
+            for shift in [1u16, 2, 4, 8] {
+                words.push(vop2(2, 0x25, 0xFA, 2));
+                words.push(dpp16(2, 0x110 + shift, 0xF, 0xF, shift == 1));
+            }
+            words.extend([sop1(EXEC, 0x03, 255), 0xFFFF_0000]);
+            let mut permute = vop3(3, 0x378, 258, 193, 193); // other row's last lane
+            permute[0] |= controls << 11;
+            words.extend(permute);
+            words.push(vop2(2, 0x25, 259, 2));
+            words.push(sop1(EXEC, 0x03, 193));
+            words.push(vop2(2, 0x26, 258, 1)); // subtract own term for the exclusive prefix
+            words.push(sop1(EXEC, 0x03, 0));
+
+            let p = build(&words, false);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(0)).unwrap();
+            let source = insts[1].read(Reg::V(0)).unwrap();
+            let last = insts.iter().rev().find_map(|i| i.write(Reg::V(2))).unwrap();
+            assert_eq!(
+                sections(&p, 0)[&0].shapes.get(&last).copied(),
+                recognized.then_some(Shape::Prefix(Op::AddU, source, saved, 0, false)),
+                "op_sel={controls}",
+            );
+        }
+    }
+
+    #[test]
+    fn opposite_row_permute_does_not_make_an_unknown_lane_value_local() {
+        let mut words = vec![sop1(0, 0x3D, 193)];
+        words.extend(vop3(2, 0x378, 256, 128, 128));
+        words.push(sop1(EXEC, 0x03, 0));
+
+        let p = build(&words, false);
+        let result = p.blocks[0].insts[1].write(Reg::V(2)).unwrap();
+        assert_eq!(sections(&p, 0)[&0].shapes.get(&result), None);
     }
 
     #[test]

@@ -100,6 +100,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_test_cs(body, false, ComputeIo {
+        rsrc2: (5 << 1) | ((lds_bytes / 512) << 15),
+        threads: [threads, 1, 1],
+    }, buffer_store_dword(0, 8, 0))
+}
+
+fn build_test_cs(body: &[u32], wave64: bool, compute: ComputeIo, store: [u32; 2]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -110,13 +117,13 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&store);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -146,10 +153,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             user_data: 4,
             slot: 1,
         }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
-            threads: [threads, 1, 1],
-        }),
+        io: StageIo::Cs(compute),
         code,
     };
 
@@ -1620,5 +1624,46 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
                 want.to_bits(),
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "requires a device that can run Wave32 compute"]
+fn opposite_row_fetch_inactive_prefix_matches_scalar_sum_on_wave32() {
+    let mut body = vec![
+        0x4a00_0081, // v_add_nc_u32 v0, 1, v0: one-based lane value
+        0xbe86_3dc1, // s_or_saveexec_b32 s6, -1
+    ];
+    body.extend(vop3(0x101, 1, 128, vgpr(0), sgpr(6))); // saved EXEC ? v0 : 0
+    body.push(vop1(1, 2, vgpr(1)));
+    for shift in [1u32, 2, 4, 8] {
+        body.push(0x4a04_04fa); // v_add_nc_u32 v2, v2, v2 DPP16
+        body.push(0xff00_0002 | ((0x110 + shift) << 8) | (u32::from(shift == 1) << 19));
+    }
+    body.extend([
+        s_mov_b32(126, 255), 0xffff_0000, // enable upper row only
+        0xd778_4803, 0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        0x4a04_0503, // add lower row total to upper row prefix
+        s_mov_b32(126, 193),
+        0x4c04_0302, // subtract the current lane to make the prefix exclusive
+        s_mov_b32(126, 6),
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0: output byte offset
+    ]);
+    let shader = build_test_cs(
+        &body, false, ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] },
+        [0xe070_1000, 0x8002_0204], // buffer_store_dword v2, v4, s[8:11], 0 offen
+    );
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(std::env::var_os("VICTORY_WARP").is_some_and(|s| s == "1"))
+        .expect("Wave32 device");
+    let (root, pso) = host.compute_pipeline(&shader).expect("prefix pipeline");
+    let out = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+        views: &[View::RawUav(33)], samplers: &[], groups: [1, 1, 1],
+    }).expect("prefix dispatch");
+    assert_eq!(out[0][0], 0);
+    for lane in 0..32 {
+        let expected = (1..=lane as u32).sum::<u32>();
+        assert_eq!(out[0][lane + 1], expected, "lane {lane}");
     }
 }
