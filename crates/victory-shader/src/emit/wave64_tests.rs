@@ -44,6 +44,61 @@ fn native(body: &[u32]) -> NativeProgram {
     native_of(body, true, 64)
 }
 
+fn partial_exec_first_lane(value_source: u32, sink_exec: u32) -> NativeProgram {
+    native(&[
+        0xd765_0003, 0x0001_00c1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xd766_0000, 0x0002_06c1, // v_mbcnt_hi_u32_b32 v0, -1, v3
+        0x7d88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xbe8c_246a, // s_and_saveexec_b64 s[12:13], vcc
+        0xbf88_0008, // skip the body when the outer mask is empty
+        0x7da8_0001, // v_cmpx_gt_u32 exec, s1, v0
+        value_source,
+        0x7e0e_0505, // v_readfirstlane_b32 s7, v5
+        sink_exec,
+        0x7e0c_0207, // v_mov_b32 v6, s7
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xe070_1000, 0x8002_0604, // buffer_store_dword v6, v4, s[8:11], 0 offen
+        0xbefe_040c, // s_mov_b64 exec, s[12:13]
+    ])
+}
+
+#[test]
+#[ignore = "requires Wave32 GPU readback"]
+fn first_lane_of_uniform_guarded_data_runs_in_two_host_waves() {
+    let native = partial_exec_first_lane(0x7e0a_0202, 0xbf80_0000); // v5 = s2; nop
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered(&native, &p, &HashSet::new()).expect("uniform guarded first-lane read");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("Wave32 device");
+    let (root, pso) = host.compute_pipeline(&shader).expect("first-lane pipeline");
+    for limit in [0, 1, 2, 31, 32, 33, 63, 64] {
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![64, limit, 0xa535_7b29, 0, 0, 0, 0, 0]))],
+            views: &[View::RawUav(64)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).expect("first-lane readback");
+        for lane in 0..64 {
+            assert_eq!(out[0][lane], if lane < limit as usize { 0xa535_7b29 } else { 0 }, "limit {limit}, lane {lane}");
+        }
+    }
+}
+
+#[test]
+fn first_lane_requires_uniform_input_and_a_masked_sink() {
+    for (source, sink) in [
+        (0x7e0a_0300, 0xbf80_0000), // v5 = v0 varies by lane
+        (0x7e0a_0202, 0xbefe_040c), // v5 = s2, then restore EXEC before consuming s7
+    ] {
+        let native = partial_exec_first_lane(source, sink);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let lowered = lowered(&native, &p, &HashSet::new());
+        assert!(matches!(lowered, Err(ShaderError::Unsupported {
+            what: "a first-lane read where not every lane runs", ..
+        })), "incorrectly accepted source {source:#x} and sink {sink:#x}: {lowered:?}");
+    }
+}
+
 /// The same for a console of 32-lane waves when `wave64` is not set, with `threads` threads.
 fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
     let mut words = vec![
