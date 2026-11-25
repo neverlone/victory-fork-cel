@@ -218,7 +218,7 @@ impl Ctx<'_> {
             index[b] = n;
         }
         let idom = crate::ir::idoms(&p.blocks, &order, &index);
-        let sections = (0..p.blocks.len()).map(|b| wave::sections(p, b)).collect();
+        let sections = (0..p.blocks.len()).map(|b| wave::sections(p, b, true)).collect();
         Ctx {
             p,
             st,
@@ -747,7 +747,7 @@ pub(super) fn find(p: &Program, st: &Structured, why: bool) -> OwnBits {
     let mut out = OwnBits::default();
     let mut ctx: Option<Ctx> = None;
     for b in 0..p.blocks.len() {
-        let sections = wave::sections(p, b);
+        let sections = wave::sections(p, b, true);
         let mut starts: Vec<_> = sections.keys().copied().collect();
         starts.sort_unstable();
         for s in starts {

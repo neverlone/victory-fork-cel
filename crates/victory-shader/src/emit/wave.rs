@@ -146,7 +146,7 @@ pub(crate) struct Section {
 }
 
 /// Every whole-wave section of `block`, by start index.
-pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
+pub(crate) fn sections(p: &Program, block: usize, full_wave: bool) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
@@ -180,7 +180,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        let shapes = simulate(&insts[i + 1..end], wave, saved, full_wave);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
@@ -268,7 +268,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], wave: u32, saved: Value, full_wave: bool) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -598,13 +598,20 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
+                // In the captured prefix idiom each active upper row reads
+                // the last lane of its inactive lower row. The same reserved
+                // OP_SEL bit is set in both wave widths. On Wave64 a complete
+                // prefix crosses halves, so the half-wave retry cannot use it.
+                let upper_rows = if wave == 64 {
+                    0xffff_0000_ffff_0000
+                } else {
+                    0xffff_0000
+                };
                 match (sel(1), sel(2)) {
-                    // The console compiler also sets reserved bit 3 for the
-                    // Wave32 prefix idiom: upper row reads lane 15 by FI.
-                    // Allow that encoding only with the observed lane mask and selectors.
                     (Some(s1), Some(s2))
                         if v.opsel != 9
-                            || (wave, exec, s1, s2) == (32, 0xffff_0000, u32::MAX, u32::MAX) =>
+                            || ((wave == 32 || full_wave)
+                                && (exec, s1, s2) == (upper_rows, u32::MAX, u32::MAX)) =>
                     {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
@@ -969,9 +976,57 @@ mod tests {
             let source = insts[1].read(Reg::V(0)).unwrap();
             let last = insts.iter().rev().find_map(|i| i.write(Reg::V(2))).unwrap();
             assert_eq!(
-                sections(&p, 0)[&0].shapes.get(&last).copied(),
+                sections(&p, 0, true)[&0].shapes.get(&last).copied(),
                 recognized.then_some(Shape::Prefix(Op::AddU, source, saved, 0, false)),
                 "op_sel={controls}",
+            );
+        }
+    }
+
+    #[test]
+    fn opposite_row_fetch_inactive_finishes_a_wave64_prefix() {
+        const UPPER_ROW: u32 = 0xFFFF_0000;
+        const LOWER_ROW: u32 = 0x0000_FFFF;
+        for (controls, lo, hi, selector_hi, full_wave, recognized) in [
+            (1, UPPER_ROW, UPPER_ROW, 193, true, true),
+            (9, UPPER_ROW, UPPER_ROW, 193, true, true),
+            (9, UPPER_ROW, UPPER_ROW, 193, false, false),
+            (0, UPPER_ROW, UPPER_ROW, 193, true, false),
+            (5, UPPER_ROW, UPPER_ROW, 193, true, false),
+            (9, LOWER_ROW, UPPER_ROW, 193, true, false),
+            (9, UPPER_ROW, LOWER_ROW, 193, true, false),
+            (9, UPPER_ROW, UPPER_ROW, 128, true, false),
+        ] {
+            let mut words = vec![sop1(0, 0x25, 193)]; // s_or_saveexec_b64 s[0:1], -1
+            words.extend(vop3(1, 0x101, 128, 256, 0));
+            words.push(vop1(2, 0x01, 257));
+            for shift in [1u16, 2, 4, 8] {
+                words.push(vop2(2, 0x25, 0xFA, 2));
+                words.push(dpp16(2, 0x110 + shift, 0xF, 0xF, shift == 1));
+            }
+            words.extend([sop1(EXEC, 0x03, 255), lo]);
+            words.extend([sop1(EXEC + 1, 0x03, 255), hi]);
+            let mut permute = vop3(3, 0x378, 258, 193, selector_hi);
+            permute[0] |= controls << 11;
+            words.extend(permute);
+            words.push(vop2(2, 0x25, 259, 2));
+            words.extend(vop3(4, 0x360, 258, 128 + 31, 0)); // sum of lanes 0..31
+            words.push(sop1(EXEC, 0x03, 128));
+            words.push(sop1(EXEC + 1, 0x03, 193));
+            words.push(vop2(2, 0x25, 4, 2));
+            words.push(sop1(EXEC, 0x04, 193));
+            words.push(vop2(2, 0x26, 258, 1));
+            words.push(sop1(EXEC, 0x04, 0));
+
+            let p = build(&words, true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(0)).unwrap();
+            let source = insts[1].read(Reg::V(0)).unwrap();
+            let last = insts.iter().rev().find_map(|i| i.write(Reg::V(2))).unwrap();
+            assert_eq!(
+                sections(&p, 0, full_wave)[&0].shapes.get(&last).copied(),
+                recognized.then_some(Shape::Prefix(Op::AddU, source, saved, 0, false)),
+                "op_sel={controls}, exec_lo={lo:#x}, exec_hi={hi:#x}, selector_hi={selector_hi}, full_wave={full_wave}",
             );
         }
     }
@@ -984,7 +1039,7 @@ mod tests {
 
         let p = build(&words, false);
         let result = p.blocks[0].insts[1].write(Reg::V(2)).unwrap();
-        assert_eq!(sections(&p, 0)[&0].shapes.get(&result), None);
+        assert_eq!(sections(&p, 0, true)[&0].shapes.get(&result), None);
     }
 
     #[test]
@@ -1130,7 +1185,7 @@ mod tests {
                 .unwrap();
             let v2_val = insts[insts.len() - 4].write(Reg::V(2)).unwrap();
             let v4_val = insts[insts.len() - 3].write(Reg::V(4)).unwrap();
-            let sec = &sections(&p, 0)[&0];
+            let sec = &sections(&p, 0, true)[&0];
             assert_eq!(
                 sec.shapes.get(&v2_val),
                 Some(&Shape::Prefix(Op::AddU, v0_in, saved, 0, false))
@@ -1177,7 +1232,7 @@ mod tests {
             let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
             // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
             let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
-            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v7, saved, 0))
+            (sections(&p, 0, true)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v7, saved, 0))
         };
         let (found, want) = shape(&words(pairs, quads));
         assert_eq!(found, Some(want));
@@ -1217,7 +1272,7 @@ mod tests {
         let insts = &p.blocks[0].insts;
         let v2_val = insts[3].write(Reg::V(2)).unwrap();
         let v3_val = insts[5].write(Reg::V(3)).unwrap();
-        let sec = &sections(&p, 0)[&0];
+        let sec = &sections(&p, 0, true)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
     }

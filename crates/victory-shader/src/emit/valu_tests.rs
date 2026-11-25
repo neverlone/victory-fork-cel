@@ -1630,40 +1630,73 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 #[test]
 #[ignore = "requires a device that can run Wave32 compute"]
 fn opposite_row_fetch_inactive_prefix_matches_scalar_sum_on_wave32() {
+    check_opposite_row_fetch_inactive_prefix(32);
+}
+
+#[test]
+#[ignore = "requires a device that can run Wave32 compute"]
+fn opposite_row_fetch_inactive_wave64_prefix_matches_scalar_sum_on_split_waves() {
+    check_opposite_row_fetch_inactive_prefix(64);
+}
+
+fn check_opposite_row_fetch_inactive_prefix(threads: u32) {
+    let wave64 = threads == 64;
+    let mov_exec = |src: u32| if wave64 { 0xbefe_0400 | src } else { 0xbefe_0300 | src };
     let mut body = vec![
         0x4a00_0081, // v_add_nc_u32 v0, 1, v0: one-based lane value
-        0xbe86_3dc1, // s_or_saveexec_b32 s6, -1
     ];
-    body.extend(vop3(0x101, 1, 128, vgpr(0), sgpr(6))); // saved EXEC ? v0 : 0
+    body.extend(vop3(0x0c4, 106, sgpr(0), vgpr(0), 0)); // vcc = s0 > v0
+    body.extend(vop3(0x101, 5, 128, vgpr(0), sgpr(106))); // zero inputs beyond the bin count
+    body.push(if wave64 { 0xbe86_25c1 } else { 0xbe86_3dc1 }); // s_or_saveexec s6, -1
+    body.extend(vop3(0x101, 1, 128, vgpr(5), sgpr(6))); // saved EXEC ? v5 : 0
     body.push(vop1(1, 2, vgpr(1)));
     for shift in [1u32, 2, 4, 8] {
         body.push(0x4a04_04fa); // v_add_nc_u32 v2, v2, v2 DPP16
         body.push(0xff00_0002 | ((0x110 + shift) << 8) | (u32::from(shift == 1) << 19));
     }
+    body.extend([s_mov_b32(126, 255), 0xffff_0000]); // enable the upper row
+    if wave64 {
+        body.extend([s_mov_b32(127, 255), 0xffff_0000]);
+    }
     body.extend([
-        s_mov_b32(126, 255), 0xffff_0000, // enable upper row only
         0xd778_4803, 0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
         0x4a04_0503, // add lower row total to upper row prefix
-        s_mov_b32(126, 193),
+    ]);
+    if wave64 {
+        body.extend([
+            0xd760_000c, 0x0001_3f02, // v_readlane_b32 s12, v2, 31
+            s_mov_b32(126, 128), s_mov_b32(127, 193), // enable only high half
+            0x4a04_040c, // add low half total to high half prefix
+        ]);
+    }
+    body.extend([
+        mov_exec(193),
         0x4c04_0302, // subtract the current lane to make the prefix exclusive
-        s_mov_b32(126, 6),
+        mov_exec(6),
         0x3408_0082, // v_lshlrev_b32 v4, 2, v0: output byte offset
     ]);
+    let previous = lower::TEST_HOST_WAVE.replace(Some(32));
     let shader = build_test_cs(
-        &body, false, ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] },
+        &body, wave64, ComputeIo { rsrc2: 5 << 1, threads: [threads, 1, 1] },
         [0xe070_1000, 0x8002_0204], // buffer_store_dword v2, v4, s[8:11], 0 offen
     );
+    lower::TEST_HOST_WAVE.set(previous);
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let host = Host::new(std::env::var_os("VICTORY_WARP").is_some_and(|s| s == "1"))
         .expect("Wave32 device");
     let (root, pso) = host.compute_pipeline(&shader).expect("prefix pipeline");
-    let out = host.dispatch(&root, &pso, &Dispatch {
-        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
-        views: &[View::RawUav(33)], samplers: &[], groups: [1, 1, 1],
-    }).expect("prefix dispatch");
-    assert_eq!(out[0][0], 0);
-    for lane in 0..32 {
-        let expected = (1..=lane as u32).sum::<u32>();
-        assert_eq!(out[0][lane + 1], expected, "lane {lane}");
+    let lengths: &[u32] = if wave64 { &[0, 1, 2, 31, 32, 33, 63, 64] } else { &[32] };
+    for &length in lengths {
+        let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+        constants[0] = length + 1;
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants))],
+            views: &[View::RawUav(threads + 1)], samplers: &[], groups: [1, 1, 1],
+        }).expect("prefix dispatch");
+        assert_eq!(out[0][0], 0);
+        for lane in 0..threads {
+            let expected = (1..=lane.min(length)).sum::<u32>();
+            assert_eq!(out[0][lane as usize + 1], expected, "length {length}, lane {lane}");
+        }
     }
 }
