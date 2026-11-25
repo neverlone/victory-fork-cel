@@ -29,6 +29,7 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+scripted-keys = ["victory-hle/scripted-keys"]
 
 [lints]
 workspace = true
