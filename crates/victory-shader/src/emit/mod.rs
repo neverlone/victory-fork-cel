@@ -114,8 +114,8 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -340,6 +340,46 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// [`with_wave_wide`]'s choice, for this thread's translations.
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form of a wave64 compute
+/// program on a host of 32-lane waves allowed, as `VICTORY_WAVE_WIDE=1`
+/// allows it for all: for programs known to come out of it right, while
+/// others stay off it (two programs that moved to it lost the card, runs
+/// 121-124). The form is still tried only after the exact ones, so a
+/// program that has one keeps it.
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.replace(on);
+    let out = f();
+    WAVE_WIDE_HERE.set(before);
+    out
+}
+
+thread_local! {
+    /// [`with_firstlane_own`]'s choice, for this thread's translations.
+    static FIRSTLANE_OWN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with a first-lane read where not every lane runs
+/// taken from the host wave's own first lane, as `VICTORY_FIRSTLANE_OWN=1`
+/// takes it for all: exact where the value is the same in every lane of the
+/// console wave, which holds for the programs it is asked for (the
+/// ray-tracing structure builder's scans, which read a sum of scalars).
+pub fn with_firstlane_own<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = FIRSTLANE_OWN_HERE.replace(on);
+    let out = f();
+    FIRSTLANE_OWN_HERE.set(before);
+    out
+}
+
+/// Whether [`with_firstlane_own`] asked for it on this thread.
+pub(super) fn firstlane_own_here() -> bool {
+    FIRSTLANE_OWN_HERE.get()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -422,7 +462,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WAVE_WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -499,6 +539,35 @@ pub fn emit(
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all (`VICTORY_WAVE_LDS_LOOSE=0` turns it off): LDS read and written inside
+        // one lane-branch region, ordered between the two host waves only where the region
+        // is entered and left (`lower::with_loose_lds`, approximate). A 32-lane host refuses
+        // the 64-lane form outright, which drops every dispatch of the program.
+        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0");
+        if loose_on && !strict {
+            let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
+            for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
@@ -1426,6 +1495,129 @@ mod tests {
                 got[6],
                 out[0][6]
             );
+        }
+    }
+
+    /// A program that reads its thread-group id in x takes the dispatch's
+    /// first group from a user-data dword the host sets (`USER_GROUP_BASE`)
+    /// and adds the host's group id to it: the host runs the groups past
+    /// 65,535 of an indirect record as a second execution with it at 65,535.
+    #[test]
+    fn the_group_id_in_x_starts_at_the_host_base() {
+        let words: &[u32] = &[
+            0x7E02_0205, // v_mov_b32 v1, s5 (the group id in x)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+            0x3610_028F, // v_and_b32 v8, 15, v1
+            0x340E_1082, // v_lshlrev_b32 v7, 2, v8
+            0xE070_1000,
+            0x8003_0107, // buffer_store_dword v1, v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Uav,
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            // Five user SGPRs, then the group id in x (s5).
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1 | 1 << 7,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let base = l
+            .user_data
+            .iter()
+            .find(|u| u.root == crate::RootType::Other(super::USER_GROUP_BASE))
+            .map(|u| u.index as usize)
+            .expect("no user-data dword for the first group");
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            // Three groups, with the first at 0 and at 65,535: each stores
+            // the id it read at slot (id & 15).
+            for (first, slots) in [(0u32, [0usize, 1, 2]), (65535, [15, 0, 1])] {
+                let mut constants = vec![0u32; base + 1];
+                constants[base] = first;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(constants))],
+                            views: &[super::host::View::RawUav(64)],
+                            samplers: &[],
+                            groups: [3, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                for (k, slot) in slots.into_iter().enumerate() {
+                    assert_eq!(out[0][slot], first + k as u32, "group {k} with the first at {first}: {:?}", &out[0][..16]);
+                }
+            }
         }
     }
 }

@@ -1980,6 +1980,12 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // A texture with levels on demand: its tiles are in heaps of ours,
+        // not in the texture, so they stay given until nothing names the
+        // texture any more (`crate::tiles::let_go`).
+        if let Some(tiled) = self.tiled.take() {
+            crate::tiles::let_go(self.texture.clone(), tiled);
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -2550,6 +2556,7 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }

@@ -69,6 +69,62 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// The size of the buffer if it came from the pool of spare staging
+    /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
+    /// own, released when this is dropped.
+    pooled: u64,
+}
+
+/// A staging buffer nothing holds: the buffer and where it is mapped.
+struct Spare(ID3D12Resource, usize);
+
+// SAFETY: a D3D12 buffer and its mapping, touched by nobody while it is
+// spare.
+unsafe impl Send for Spare {}
+
+/// Spare staging buffers by size (a power of two), and their bytes in all.
+static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+/// The most bytes kept spare, and the largest buffer that is pooled.
+const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// Staging buffers taken from the spare ones, and made, since the start.
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A mapped upload buffer of `total` bytes for a texture's staging, all
+/// zeros, and its pool size (0: not pooled).
+///
+/// Every texture the title streams in got a buffer of its own from the
+/// host and gave it back when its staging went: about a quarter of a
+/// millisecond to make (run 213's profile: 25 ms a frame on the recording
+/// threads for some 100 uploads, most of it the graphics kernel waiting)
+/// and more to free on the thread that submits. A streaming burst is 200
+/// to 500 uploads in a frame (run 222), and those are the frames that
+/// dip. Buffers of up to 8 MiB are now kept by size and used again,
+/// zeroed as a new one is (levels not there yet must read as zeros).
+/// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let size = total.max(64 << 10).next_power_of_two();
+    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+    }
+    let spare = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    if let Some(Spare(buffer, data)) = spare {
+        SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the buffer's own mapping, `size` bytes, which nothing
+        // else holds.
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
+        return Some((buffer, data as *mut u8, size));
+    }
+    SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -294,8 +350,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=0` to wait).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -307,7 +362,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
 /// ms, the texture's own lock 0).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
+/// With this on, the refresh asks for the lock without waiting. If the
 /// runtime has it, the texture is read through the kernel instead, which
 /// needs no lock: it fails if a page is not there, and then the texture is
 /// left as it is and read at its next refresh, a frame later. A read
@@ -317,7 +372,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -401,6 +456,15 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Nothing holds the staging any more (lists keep it until they are
+        // reset, after their submission has run): its buffer is spare.
+        if self.pooled != 0 {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled <= SPARE_MOST.0 {
+                all.1 += self.pooled;
+                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+            }
+        }
     }
 }
 
@@ -427,14 +491,14 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
-/// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
-/// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
+/// Lets go of staging buffers no list holds or has used in `idle_ms`
+/// milliseconds and four frames. A staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(idle_ms: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -444,7 +508,6 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -919,37 +982,28 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
-            }
-            last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
-            });
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
-        }
-        // View memory has no write-watch, and a texture there was hashed
-        // whole at every check: 229 MB and 51 ms a frame in a gameplay view
-        // where two textures change (run 58). It is guarded now, as buffers
-        // in view memory are: a write of the title's to it faults once and
-        // is noted, a mapping is announced by the runtime. While neither
-        // happened the texture is as it was. What the guard cannot see (a
-        // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
-        // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+        let guard_on = *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"));
+        if let Some((now, written, guarded)) =
+            waited(1, || crate::watch::writes_since_kind(start, start + size, guard_on, last.asked))
         {
+            if !guarded {
+                if last.asked != 0 && written.is_empty() {
+                    return 0;
+                }
+                last.asked = now;
+                // Read through the copy, which stands unmapped pages: memory of
+                // big pools is too slow to ask page by page.
+                with_read(size, |read| {
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                    self.detile(read);
+                });
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                return size;
+            }
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let unwritten = last.asked != 0 && written.is_empty();
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if unwritten && !turn {
@@ -1395,7 +1449,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, pooled) = staging_buffer(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1424,6 +1478,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        pooled,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

@@ -155,7 +155,9 @@ const WINDOW_MOST: u64 = 64;
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
-/// their record there with no pass of ours, until one of these: a compute
+/// their record there with no pass of ours and no barrier (the scratch
+/// buffer stays readable as arguments until the next clamp), until one of
+/// these: a compute
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
@@ -771,9 +773,15 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_GROUP_BASE {
+            // The first group of the dispatch in x: 0 but for the second
+            // execution of an indirect record split at 65,535 groups, whose
+            // caller sets it itself ([`group_base_word`]).
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -2391,7 +2399,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)
@@ -2973,9 +2981,31 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        // A program that reads its group id in x: where it takes the first
+        // group of the dispatch (root parameter, dword), and where the
+        // second records begin once they are made. (Dispatches are never
+        // clamped in windows, so the window paths below never see one.)
+        let group_base = if kind == DISPATCH { group_base_word(p) } else { None };
+        let mut second: Option<((u32, u32), u64)> = None;
         let (bounded, at) = match hit {
-            Some(hit) => hit,
+            Some((scratch, at, step)) => {
+                // Diagnostics of windows: the record clamped again and
+                // compared (`crate::indirect::window_check`).
+                if crate::indirect::window_check()
+                    && crate::indirect::check_hit(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step),
+                        &scratch,
+                        at,
+                    )
+                {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                (scratch, at)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -3010,6 +3040,11 @@ impl State {
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                } else if let Some(base) = group_base {
+                    // The groups past 65,535 in x run as second records,
+                    // `records` records on in the scratch buffer.
+                    second = Some((base, u64::from(step) * u64::from(records)));
+                    crate::indirect::bound_split(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
@@ -3039,7 +3074,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -3062,10 +3096,31 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        // The groups past 65,535 in x: the second records, with the first
+        // group in x at 65,535 (a dispatch runs at most 65,535 groups in
+        // each dimension). Records that asked for fewer run no groups here.
+        if let Some(((param, dword), offset)) = second {
+            // SAFETY: as above; the compute root signature bound has the
+            // user-data parameter `param` with dword `dword`.
+            unsafe {
+                list.list.SetComputeRoot32BitConstant(param, 65535, dword);
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at + offset,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+                list.list.SetComputeRoot32BitConstant(param, 0, dword);
+            }
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // The scratch buffer stays readable as arguments: the next draw of
+        // the window reads it with no barrier, and the next clamp moves it
+        // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -3073,6 +3128,28 @@ impl State {
         }
         true
     }
+}
+
+/// Where the compute program of `p` takes the first thread group of its
+/// dispatch in x (`victory_shader::emit::USER_GROUP_BASE`): its user-data
+/// root parameter and dword. `None` if it does not read the group id in x,
+/// or with `VICTORY_DISPATCH_SPLIT=0`.
+/// shortcut: only programs that read the group id in x run their groups
+/// past 65,535 (a second execution for every indirect dispatch of the
+/// others would double the indirect compute commands of a frame); the
+/// others' are still cut, which matters for one that takes its work from a
+/// counter. The only program seen asking for more in the prologue reads it.
+fn group_base_word(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_SPLIT").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    p.stages.iter().find_map(|stage| {
+        let (param, _) = stage.user_data?;
+        let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+        let u = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
+        Some((param, u.index))
+    })
 }
 
 /// The host command signature for one argument of `kind` with records

@@ -24,6 +24,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+mod guarded_first_lane;
 
 type Why = &'static str;
 
@@ -694,7 +695,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
         };
         Ok((out, reserved))
     };
-    let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b)).collect();
+    let sections: Vec<_> = (0..p.blocks.len()).map(|b| super::wave::sections(p, b, true)).collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
     let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
         for &b in &order {
@@ -882,7 +883,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if (0..n).any(|r| reads[r] && writes[r]) && !LDS_LOOSE.get() {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -949,6 +950,20 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_loose_lds`].
+    static LDS_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with LDS reads and writes inside one lane-branch region accepted
+/// ([`lds_meetings`]): the two host waves of a console wave meet only where
+/// such a region is entered and left. APPROXIMATE: a value one half writes and
+/// the other half reads inside the region may be read stale. The last resort
+/// for console wave64 programs a 32-lane host would otherwise refuse.
+pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_LOOSE.replace(true);
+    let r = f();
+    LDS_LOOSE.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1753,7 +1768,7 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
-            let found = super::wave::sections(p, b);
+            let found = super::wave::sections(p, b, !self.local);
             for (&start, sec) in &found {
                 for i in start + 1..sec.end {
                     for &(_, w) in &p.blocks[b].insts[i].writes {
@@ -2031,7 +2046,10 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        // as `wave_reduce`: each host wave on its own (or a group one host wave holds whole)
+        // keeps its own sum
+        let own = self.local || self.exchange.as_ref().is_some_and(|e| e.1);
+        if self.exchange.is_some() && !own {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -2361,8 +2379,33 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            // The host's group id plus the dispatch's first group in x
+            // (`shader.rs` `USER_GROUP_BASE`).
+            Input::GroupId(0) => {
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            // Bits 0-5 the group's console waves, 6-11 this wave's index
+            // among them (as Mesa reads `tg_size`).
+            Input::GroupInfo => {
+                let StageIo::Cs(cs) = self.x.native.io else {
+                    return Val::Missing("the thread-group info SGPR");
+                };
+                let wave: u32 = if self.x.native.wave64 { 64 } else { 32 };
+                let threads = cs.threads.iter().product::<u32>();
+                let (e, i32t) = (self.s.entry, self.s.t.i32);
+                let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+                let w = self.s.m.i32(wave.trailing_zeros());
+                let index = self.s.m.bin(e, Bin::LShr, flat, w);
+                let six = self.s.m.i32(6);
+                let index = self.s.m.bin(e, Bin::Shl, index, six);
+                let count = self.s.m.i32(threads.div_ceil(wave) & 0x3f);
+                return Val::I32(self.s.m.bin(e, Bin::Or, index, count));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -3785,7 +3828,17 @@ impl<'a> Lower<'a> {
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
         // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+        // (local waves with any mask taken approximately: the host wave's own answer, as
+        // `local_any` gives for every wave-wide test)
+        // Opt-in (`VICTORY_SCC_LOCAL_ANY=1`): with it 5dc3/6f22 run in waves of 32 but
+        // the frame gained black blocks and lost walls (runs c4/c5, 2026-11-25).
+        let local_any = self.local
+            && self.local_any
+            && std::env::var_os("VICTORY_SCC_LOCAL_ANY").is_some_and(|v| v == "1");
+        if !self.console_lanes
+            || self.local && !local_any
+            || self.exchange.is_none() && self.halves.is_some()
+        {
             return Err(LANE_MASK);
         }
         let made = self.def_block.get(&scc).copied();
@@ -3798,7 +3851,7 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if local_any || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
@@ -5335,6 +5388,20 @@ impl<'a> Lower<'a> {
                 };
                 (self.s.m.bin(c, op, a, b), None)
             }
+            // Low or high halves of two dwords packed: s0's in bits 0-15.
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xffff));
+                let a = if name == "s_pack_hh_b32_b16" { self.s.m.bin(c, Bin::LShr, a, k16) } else { a };
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let high = self.s.m.i32(0xffff_0000);
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, a, b), None)
+            }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
@@ -6621,6 +6688,15 @@ impl<'a> Lower<'a> {
             return r;
         }
         let mut guard = self.guard(b, i)?;
+        if name == "v_readfirstlane_b32"
+            && self.exchange.as_ref().is_some_and(|e| !e.1)
+            && !self.local && !self.all_lanes(b)
+            && guarded_first_lane::can_read_locally(self.x, b, i)
+        {
+            let source = self.src(inst, 0)?;
+            let (first, _) = self.first_lane(source, guard);
+            return self.write_i(inst, first, guard);
+        }
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
@@ -7421,7 +7497,11 @@ impl<'a> Lower<'a> {
                     None if self.mask_data == MaskData::Console => {
                         // Each host wave taken as a wave of its own has no
                         // console lane numbers to pick the bits by.
-                        if self.local {
+                        // (approximate mode: lanes numbered by the group's flat thread
+                        // index, the console's numbering where its waves run consecutive
+                        // threads, as compute and mesh groups do)
+                        let threads = matches!(self.x.native.stage, HwStage::Cs | HwStage::Ms);
+                        if self.local && !(self.local_any && threads) {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;
@@ -7589,7 +7669,9 @@ impl<'a> Lower<'a> {
                         // the console wave (the ray-tracing builder's scans read a sum of
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1"))
+                            || super::firstlane_own_here()
+                        {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
