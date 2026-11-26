@@ -700,7 +700,7 @@ fn two_reductions_that_share_their_end_translate_as_two_sections() {
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     // the section starts in the arms and ends in the join; afterwards each block holds whole ones
-    let sections = |p: &ir::Program| (0..p.blocks.len()).map(|b| super::wave::sections(p, b).len()).sum::<usize>();
+    let sections = |p: &ir::Program| (0..p.blocks.len()).map(|b| super::wave::sections(p, b, true).len()).sum::<usize>();
     assert_eq!(sections(&p), 0);
     let q = ir::whole_sections(&p).expect("sections to join");
     assert_eq!(sections(&q), 2);
@@ -783,8 +783,8 @@ fn a_wave_sum_of_doubles_is_the_consoles() {
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     // the section leaves the sum's two dwords in s20 and s21
-    let block = (0..p.blocks.len()).find(|&b| !super::wave::sections(&p, b).is_empty()).expect("a section");
-    let sums = super::wave::sections(&p, block)
+    let block = (0..p.blocks.len()).find(|&b| !super::wave::sections(&p, b, true).is_empty()).expect("a section");
+    let sums = super::wave::sections(&p, block, true)
         .into_values()
         .flat_map(|s| s.shapes.into_values())
         .filter(|s| matches!(s, super::wave::Shape::Sum64 { .. }))
