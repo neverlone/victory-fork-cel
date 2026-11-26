@@ -268,6 +268,26 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
+/// Whether `v_permlanex16_b32` in a whole-wave section is followed strictly
+/// (`VICTORY_PERMLANE_STRICT=1`, and always in tests): only the OP_SEL forms
+/// 0, 1 and 9, a source lane read only if it runs or FI is set, and never a
+/// lane's own value of a VGPR carried to another lane (fxceless #800).
+///
+/// Off by default: the strict reading refused three compute programs that
+/// translated before it (CS_MaterialTilesInitial bad01f53f53248e5,
+/// CS_Prop_BatchCull 17af15c4015cb4b6, CS_Prop_BatchNoCull fdd56d97a806bcca:
+/// "a first-lane read / a lane mask exchanged where not every lane runs"),
+/// their dispatches were dropped, and the lit HDR target came out smeared
+/// (the haze; bisected on an RTX 5060, 2026-11-26). The earlier reading takes
+/// every form and every source lane's value as is, and the picture is sharp.
+pub(crate) fn permlane_strict() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PERMLANE_STRICT").is_some_and(|v| v == "1"))
+}
+
 fn simulate(insts: &[Inst], wave: u32, saved: Value, full_wave: bool) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
@@ -586,9 +606,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, full_wave: bool) -> HashMap
                     .collect()
             }
             ("v_permlanex16_b32", Some(a))
-                if matches!(v.opsel, 0 | 1 | 9)
-                    && v.dpp.is_none()
-                    && matches!(v.src.first(), Some(Operand::Vector { .. })) =>
+                if !permlane_strict()
+                    || (matches!(v.opsel, 0 | 1 | 9)
+                        && v.dpp.is_none()
+                        && matches!(v.src.first(), Some(Operand::Vector { .. }))) =>
             {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
@@ -607,9 +628,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, full_wave: bool) -> HashMap
                 } else {
                     0xffff_0000
                 };
+                let strict = permlane_strict();
                 match (sel(1), sel(2)) {
                     (Some(s1), Some(s2))
-                        if v.opsel != 9
+                        if !strict
+                            || v.opsel != 9
                             || ((wave == 32 || full_wave)
                                 && (exec, s1, s2) == (upper_rows, u32::MAX, u32::MAX)) =>
                     {
@@ -623,8 +646,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value, full_wave: bool) -> HashMap
                                 // FI reads the preceding register value even with source EXEC
                                 // clear. An external lane's opaque VGPR is still unavailable:
                                 // treating it as Own would attribute it to the destination lane.
-                                if (fetch_inactive || exec >> source & 1 != 0)
-                                    && !matches!(value, Sym::Own(_))
+                                if !strict
+                                    || ((fetch_inactive || exec >> source & 1 != 0)
+                                        && !matches!(value, Sym::Own(_)))
                                 {
                                     value
                                 } else {
