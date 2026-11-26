@@ -2486,6 +2486,26 @@ fn relay_exact() -> bool {
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
+/// Which of the second stage's three narrower waits ([`relay_exact`]) are
+/// taken (`VICTORY_RELAY_EXACT=<mask>`, all when unset): 1 = at
+/// [`late_most`] lists in the air, wait until there are fewer, not none;
+/// 2 = stale copies wait only for the flights that declared them (with
+/// card steps); 4 = a submission that reads what flights write waits only
+/// for those flights. A part left out waits for everything, as at stage 1.
+/// To find which of them leaves faces dark (they are right at
+/// `VICTORY_RELAY=1`) and keep the others' speed.
+fn relay_exact_part(bit: u32) -> bool {
+    static MASK: OnceLock<u32> = OnceLock::new();
+    let mask = *MASK.get_or_init(|| {
+        let mask = std::env::var("VICTORY_RELAY_EXACT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(7);
+        if relay_exact() && mask != 7 {
+            tracing::info!(mask, "the relay's second stage, only these of its waits (VICTORY_RELAY_EXACT)");
+        }
+        mask
+    });
+    relay_exact() && mask & bit != 0
+}
+
 /// Whether the pieces the relay fetches from the card's memory come over the
 /// card's copy queue (`VICTORY_RELAY_COPY=1`) and not over the queue that
 /// draws.
@@ -5224,7 +5244,7 @@ impl Host {
             self.settle(&mut submitted, WHY_WRITES);
         } else if sizes {
             self.settle(&mut submitted, WHY_READ);
-        } else if most && relay_exact() {
+        } else if most && relay_exact_part(1) {
             // Until there are fewer, not until there are none.
             relay_wait(WHY_MOST, |line| line.lists < late_most());
         } else if most {
@@ -5451,7 +5471,7 @@ impl Host {
         mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
     ) {
-        if relay_exact() && card_steps::stage() > 0 {
+        if relay_exact_part(2) && card_steps::stage() > 0 {
             for _ in 0..3 {
                 #[cfg(feature = "diagnostics")]
                 blame_stale(&stale);
@@ -5506,7 +5526,7 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
-            if relay_exact() && why == WHY_READ {
+            if relay_exact_part(4) && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {

@@ -23,8 +23,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 const SLOTS: u32 = 16;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=3, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
-cbuffer Size : register(b0) { uint w; uint h; uint premultiplied; };
+#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+cbuffer Size : register(b0) { uint w; uint h; uint premultiplied; float sharpness; };
 Texture2D<float4> game : register(t0);
 Texture2D<float4> ui : register(t1);
 RWTexture2D<float4> outp : register(u0);
@@ -35,6 +35,23 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
     float2 uv = (float2(id.xy) + 0.5) / float2(w, h);
     float4 g = game.Load(int3(id.xy, 0));
+    if (sharpness > 0.0) {
+        // Contrast-adaptive sharpening (after AMD FidelityFX CAS): the game
+        // plane is the title's upscale of a half-size render, soft; a
+        // cross of neighbours lifts its edges, less where contrast is high.
+        int2 p = int2(id.xy);
+        int2 hi = int2(w - 1, h - 1);
+        float3 c = g.rgb;
+        float3 n = game.Load(int3(clamp(p + int2(0, -1), 0, hi), 0)).rgb;
+        float3 s = game.Load(int3(clamp(p + int2(0, 1), 0, hi), 0)).rgb;
+        float3 l = game.Load(int3(clamp(p + int2(-1, 0), 0, hi), 0)).rgb;
+        float3 r = game.Load(int3(clamp(p + int2(1, 0), 0, hi), 0)).rgb;
+        float3 mn = saturate(min(c, min(min(n, s), min(l, r))));
+        float3 mx = saturate(max(c, max(max(n, s), max(l, r))));
+        float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1.0 / 65536.0)));
+        float3 wt = amp * (-1.0 / lerp(8.0, 5.0, saturate(sharpness)));
+        g.rgb = saturate((c + (n + s + l + r) * wt) / (1.0 + 4.0 * wt));
+    }
     float4 u = ui.SampleLevel(linear_clamp, uv, 0);
     float3 c = premultiplied != 0 ? g.rgb * (1.0 - u.a) + u.rgb : lerp(g.rgb, u.rgb, u.a);
     outp[id.xy] = float4(c, 1.0);
@@ -117,6 +134,18 @@ fn rgba8(format: DXGI_FORMAT) -> bool {
     matches!(format.0, 27 | 28)
 }
 
+/// How much the game plane is sharpened as it is laid under the interface
+/// (`VICTORY_SHARPEN=<0..1>`, 0 when unset: not at all). The Series S game
+/// plane is the title's own upscale of a render at half the height, soft
+/// beside the interface; 0.5 is a moderate lift, 1 the most.
+fn sharpness() -> f32 {
+    static SET: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHARPEN").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
+        if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }
+    })
+}
+
 fn premultiplied() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_PREMULTIPLIED").is_some_and(|v| v == "1"))
@@ -147,7 +176,11 @@ pub(crate) fn record(
     if kept.is_none() {
         *kept = Some(match make(device) {
             Ok(p) => {
-                tracing::info!(premultiplied = premultiplied(), "present planes: the interface is laid over the game");
+                tracing::info!(
+                    premultiplied = premultiplied(),
+                    sharpen = sharpness(),
+                    "present planes: the interface is laid over the game"
+                );
                 Some(p)
             }
             Err(e) => {
@@ -223,7 +256,7 @@ pub(crate) fn record(
         before.push(t(ui, ui_state, read));
         after.push(t(ui, read, ui_state));
     }
-    let constants: [u32; 3] = [w as u32, h, u32::from(premultiplied())];
+    let constants: [u32; 4] = [w as u32, h, u32::from(premultiplied()), sharpness().to_bits()];
     // SAFETY: an open list (the present's); slots of our heap; live
     // resources and objects (the pass's own live as long as the process,
     // the texture is kept by the present's list).
@@ -235,7 +268,7 @@ pub(crate) fn record(
         list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         list.SetComputeRootSignature(&pass.root);
         list.SetPipelineState(&pass.pso);
-        list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         list.SetComputeRootDescriptorTable(1, gpu);
         list.Dispatch((w as u32).div_ceil(8), h.div_ceil(8), 1);
         list.ResourceBarrier(&after);
