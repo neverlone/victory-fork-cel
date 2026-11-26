@@ -901,6 +901,18 @@ fn fair_due() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
 }
 
+/// Frames within which slots written count as one cut's ([`TextureQueue::due`]).
+const CUT_FRAMES: u64 = 8;
+/// Slots never looked at, written within [`CUT_FRAMES`], that make a cut.
+const CUT_SLOTS: usize = 256;
+
+/// Whether a cut's slots are served first ([`TextureQueue::due`]; on
+/// unless `VICTORY_CUT_FIRST=0`).
+fn cut_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_FIRST").is_none_or(|v| v != "0"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -948,6 +960,13 @@ impl TextureQueue {
     ///   cutscene, which the pass's time then cut, and slots never looked
     ///   at waited 300 to 1,500 frames: faces whose textures are picked by
     ///   index read an empty slot (black) or an older view (red, noise).
+    ///
+    /// At a cut ([`CUT_SLOTS`] or more slots never looked at, written in the
+    /// last [`CUT_FRAMES`] frames) those go first of all, newest first: they
+    /// are the new shot's. Served in turns with the backlog, the textures
+    /// of a character the cut brings in waited some 12 s behind 2,900 slots
+    /// written up to 578 frames before, and she was drawn flat meanwhile
+    /// (Noe's PC, opening cutscene). `VICTORY_CUT_FIRST=0`: in turns.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
@@ -959,6 +978,16 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
+        let recent = fresh.iter().take_while(|f| f.0 + CUT_FRAMES >= frame).count();
+        let mut first: Vec<(u32, u64)> = Vec::new();
+        if cut_first() && recent >= CUT_SLOTS {
+            first.extend(fresh.drain(..recent).map(|(_, index, write)| (index, write)));
+            if first.len() >= max {
+                first.truncate(max);
+                return first;
+            }
+        }
+        let max = max - first.len();
         let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
         while new < old && fresh_order.len() < max {
@@ -974,7 +1003,8 @@ impl TextureQueue {
             let mut order: Vec<(u32, u64)> = again_order.collect();
             order.extend(fresh_order);
             order.truncate(max);
-            return order;
+            first.extend(order);
+            return first;
         }
         let mut fresh_order = fresh_order.into_iter();
         let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
@@ -987,7 +1017,8 @@ impl TextureQueue {
             order.extend(b);
         }
         order.truncate(max);
-        order
+        first.extend(order);
+        first
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -5395,6 +5426,30 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    /// At a cut, the slots it wrote go ahead of an older backlog and of
+    /// slots looked at before.
+    #[test]
+    fn a_cuts_slots_are_served_before_the_backlog() {
+        let mut q = TextureQueue::default();
+        // A backlog written long ago, and one slot looked at before.
+        for i in 0..1000u32 {
+            q.written(i, 1, 0, false);
+        }
+        let w = q.due(u64::MAX, 2000).iter().find(|d| d.0 == 0).unwrap().1;
+        q.later(0, w, 1, 1);
+        // The cut: CUT_SLOTS slots written in frame 600.
+        for i in 0..CUT_SLOTS as u32 {
+            q.written(5000 + i, 600, 0, false);
+        }
+        let order = q.due(602, 2000);
+        assert!(order[..CUT_SLOTS].iter().all(|d| d.0 >= 5000));
+        assert_eq!(order.len(), 1000 + CUT_SLOTS);
+        // Long after, the turns as before.
+        assert!(q.due(700, 2000)[0].0 < 5000);
+        // Cut short at `max`.
+        assert_eq!(q.due(602, 10).len(), 10);
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
