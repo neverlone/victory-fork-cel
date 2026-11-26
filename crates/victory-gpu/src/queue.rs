@@ -136,7 +136,8 @@ fn present_behind() -> bool {
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    // Several planes are composited by the old way.
+    if this.is_null() || planes != 1 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -894,7 +895,7 @@ fn release_held_now(all: bool) {
                     Held::Present(texture, state, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&[(&texture, state)], frame);
                             }
                         };
                         if all {
@@ -1114,13 +1115,17 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a present (0x48 bytes, as upstream VIctory reads them):
+/// frame token, resource count, the plane's resources, and fields we do
+/// not read (source rectangles, placement, colour space, flags).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1392,24 +1397,45 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     if !sent_behind
         && planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        use windows::core::Interface;
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        // SAFETY: the title passes `planes` plane descriptions.
+        let described = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        // Each plane's first resource, its host texture, the state it was
+        // in, and whether it is the first plane to name that texture.
+        let mut shown: Vec<(This, ID3D12Resource, u32, bool)> = Vec::with_capacity(described.len());
+        for plane in described {
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            let earlier = shown.iter().find_map(|(_, t, state, _)| (t.as_raw() == texture.as_raw()).then_some(*state));
+            let state = earlier.unwrap_or_else(|| {
+                crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
+            });
+            shown.push((resource, texture.clone(), state, earlier.is_none()));
+        }
+        if !shown.is_empty() {
+            let sources: Vec<(&ID3D12Resource, u32)> = shown.iter().map(|(_, t, state, _)| (t, *state)).collect();
+            let result = host.present(&sources, frame);
+            for &(resource, _, state, first) in &shown {
+                if first {
+                    crate::resource::host_transition(resource, state);
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, shown[0].0, shown[0].2, result);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = result;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
