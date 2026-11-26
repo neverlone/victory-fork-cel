@@ -1116,6 +1116,23 @@ fn note_planes(planes: u32, plane_parameters: *const Plane) {
     }
 }
 
+/// Shows `texture`, in host state `state`, in our window.
+#[cfg(windows)]
+fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let over = what.over.as_ref().map(|(t, s)| {
+        let s = if *s == u32::MAX { t.state.load(Ordering::Relaxed) } else { *s };
+        (&t.texture, s)
+    });
+    let shown = host.present_over(texture, state, over, what.frame);
+    #[cfg(feature = "diagnostics")]
+    blinks(what.frame, what.resource as This, state, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (shown, what.resource);
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]

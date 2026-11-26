@@ -214,7 +214,7 @@ fn paired_override(container: &[u8], mut shader: HostShader) -> HostShader {
     // Paired VSH1 entries predate the half-view list. These programs have
     // none. The equality check includes the list on our side.
     bytes.extend_from_slice(&0u32.to_le_bytes());
-    if let Some(mut paired) = decode(&bytes) {
+    if let Some((mut paired, _)) = decode(&bytes) {
         let dxil = std::mem::replace(&mut paired.dxil, shader.dxil.clone());
         if paired == shader && dxil.starts_with(b"DXBC") {
             shader.dxil = dxil;
