@@ -663,6 +663,9 @@ fn heap_recheck() -> bool {
 /// mapped.
 pub(crate) static HEAP_TEXTURES_SAME: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
+/// Times a slot was put off a frame because a copy done on the card was
+/// still writing its memory (`crate::host::card_copy_in_air`).
+pub(crate) static HEAP_TEXTURES_AFTER_COPIES: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
@@ -2345,6 +2348,13 @@ impl State {
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
                     host.texture_slot_later(index, write, frame, most);
+                    continue;
+                }
+                // A copy done on the card may still be writing it: read
+                // once it has landed (`crate::host::card_copy_in_air`).
+                if crate::host::card_copy_in_air(address as usize, len as usize) {
+                    HEAP_TEXTURES_AFTER_COPIES.fetch_add(1, Ordering::Relaxed);
+                    host.texture_slot_held(index, write, frame + 1);
                     continue;
                 }
                 host.texture_slot_here(index);

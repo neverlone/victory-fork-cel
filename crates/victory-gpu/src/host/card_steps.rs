@@ -188,6 +188,11 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
     flying.flat_map(Taken::copied).chain(landing).collect()
 }
 
+/// Whether a destination in `copies` overlaps `from..to`.
+pub(super) fn copied_over(copies: &[Writer], from: usize, to: usize) -> bool {
+    copies.iter().any(|w| w.from < to && from < w.to)
+}
+
 /// Whether `runs` refresh another host copy of a destination in `copies`,
 /// or read it in a step that flights are not waited for otherwise
 /// (`Step::Host`): that reads title memory, where the copy is not yet.

@@ -2714,6 +2714,30 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
     LINE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether a title buffer copy done on the card ([`card_steps`] stage 2)
+/// that writes into `at..at + len` is still in the air or landing: the
+/// bytes there are not the title's yet.
+///
+/// The pass over textures picked by index reads title memory while a list
+/// is recorded, away from any submission's steps, so nothing else orders it
+/// behind such a copy (the gap `card_steps::stage` names). It found the
+/// older bytes, made the host texture from them, and with nothing telling
+/// it of the landing the slot kept them: dark or black skin on peds whose
+/// textures the title copies into place (seen with `VICTORY_RELAY=2
+/// VICTORY_CARD_STEPS=2`, gone with either switch off).
+/// `VICTORY_PICKED_AFTER_COPIES=0`: read at once, as before.
+pub(crate) fn card_copy_in_air(at: usize, len: usize) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PICKED_AFTER_COPIES").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    if card_steps::stage() < 2 || !late() {
+        return false;
+    }
+    let line = line();
+    card_steps::copied_over(&card_steps::copies(&line), at, at + len)
+}
+
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
 const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
@@ -8798,11 +8822,12 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped, {picked_after} put off behind copies on the card; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
                 picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
+                picked_after = crate::draw::HEAP_TEXTURES_AFTER_COPIES.load(Ordering::Relaxed),
                 du0 = crate::resource::DEPTH_UNORDERED[0].load(Ordering::Relaxed),
                 du1 = crate::resource::DEPTH_UNORDERED[1].load(Ordering::Relaxed),
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
