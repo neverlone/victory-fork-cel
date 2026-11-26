@@ -651,6 +651,21 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+/// Retail PresentX adds source-rectangle and destination pointers, a color
+/// space and seven option words after the common prefix. Older callers pass
+/// only the prefix for single-plane presents.
+#[cfg(windows)]
+#[repr(C)]
+struct RetailPlane {
+    prefix: Plane,
+    source_rects: *const (),
+    destination: *const (),
+    color_space: u32,
+    options: [u32; 7],
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<RetailPlane>() == 72);
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -929,16 +944,18 @@ extern "system" fn present(
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let texture = if planes > 0
+        let base_res = if planes > 0
             // SAFETY: the title passes `planes` plane descriptions.
             && let Some(plane) = unsafe { plane_parameters.as_ref() }
             && plane.count > 0
             && !plane.resources.is_null()
         {
             // SAFETY: the plane lists `count` resources.
-            let resource = unsafe { *plane.resources };
-            // The state the lists recorded so far leave it in (the next
-            // frame's, recorded before this is shown, go on from there).
+            Some(unsafe { *plane.resources })
+        } else {
+            None
+        };
+        let take_copy = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
                 crate::resource::host_transition(resource, state);
@@ -947,9 +964,8 @@ extern "system" fn present(
                 let state = if crate::list::thin::wanted() { u32::MAX } else { state };
                 (resource as usize, copy, state)
             })
-        } else {
-            None
         };
+        let texture = base_res.and_then(take_copy);
         let resource = texture.as_ref().map_or(0, |t| t.0);
         // LOCAL (port of fxceless #1189): the interface plane, as the first.
         let over = second_plane(planes, plane_parameters, resource as This)
@@ -997,6 +1013,18 @@ fn frame_ends() {
             behind::leave();
         }
     });
+    if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            crate::cores::settle();
+        }
+    }
+    if let Some(on) = crate::ab::pick("VICTORY_CACHE_CORES") {
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            crate::cores::settle();
+        }
+    }
 }
 
 /// The frame a present shows, and the title's resource it shows.
@@ -1086,23 +1114,6 @@ fn note_planes(planes: u32, plane_parameters: *const Plane) {
             );
         }
     }
-}
-
-/// Shows `texture`, in host state `state`, in our window.
-#[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
-    let Some(host) = crate::host::host() else {
-        return;
-    };
-    let over = what.over.as_ref().map(|(t, s)| {
-        let s = if *s == u32::MAX { t.state.load(Ordering::Relaxed) } else { *s };
-        (&t.texture, s)
-    });
-    let shown = host.present_over(texture, state, over, what.frame);
-    #[cfg(feature = "diagnostics")]
-    blinks(what.frame, what.resource as This, state, shown);
-    #[cfg(not(feature = "diagnostics"))]
-    let _ = (shown, what.resource);
 }
 
 /// Diagnostics: logs a presented frame that is black after one that was
@@ -1353,7 +1364,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
-        let (start, end) = (0xd0419_6698, 0xd0419_6690);
+        let (start, end) = (0xd_0419_6698, 0xd_0419_6690);
         assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);
