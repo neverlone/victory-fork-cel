@@ -58,6 +58,29 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// `VICTORY_RT_MISS=1`: the node test answers that the ray hits nothing,
+/// without reading the structure. The light the title traces then comes
+/// out as if nothing stood in its way: lit and open to the sky where the
+/// structures are missing or wrong (the builder off), instead of what the
+/// walk of stale memory gave.
+/// shortcut: a stand-in light, not the title's: no ray-traced shadow,
+/// occlusion or bounce.
+///
+/// On by default while the structure builder is off (it is unless
+/// `VICTORY_BVH_BUILDER=1`): the structures are then never built, and the
+/// test walked whatever title memory held where they would be, a hit or a
+/// miss per ray at random. `VICTORY_RT_MISS=0`: the structures are walked
+/// anyway; `=1`: a miss even with the builder on.
+/// (After cold-project-vi 0f84219, felicienradio.)
+pub fn rt_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_RT_MISS") {
+        Some(v) => v == "1",
+        // The tests check the walk itself against the reference.
+        None => !cfg!(test) && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1"),
+    })
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -122,6 +145,26 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if rt_miss() {
+            // Every ray misses: a box node gives no child, any other node a
+            // triangle miss (+infinity over 1.0).
+            let c = self.cur;
+            let k7 = self.s.m.i32(7);
+            let kind = self.s.m.bin(c, Bin::And, pointer, k7);
+            let k4 = self.s.m.i32(4);
+            let boxy = self.s.m.cmp(c, pred::IUGE, kind, k4);
+            let k6 = self.s.m.i32(6);
+            let below6 = self.s.m.cmp(c, pred::IULT, kind, k6);
+            let boxy = self.s.m.bin(c, Bin::And, boxy, below6);
+            let none = self.s.m.i32(bvh::NONE);
+            let miss = [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0];
+            for (k, m) in miss.into_iter().enumerate() {
+                let m = self.s.m.i32(m);
+                let r = self.s.m.select(c, boxy, none, m);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()
