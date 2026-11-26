@@ -45,8 +45,9 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing. Bit 2: the records are gathered
-    // (`gather`): record i lies in the source where word i of the table
+    // run is left empty and costs nothing. Bit 2: dispatch records' groups
+    // past 65,535 in x go to second records (`bound_split`). Bit 3: the
+    // records are gathered (`gather`): record i lies in the source where word i of the table
     // behind `count_buf` says (from `count_offset` on), and goes to slot i.
     uint has_count;
     uint count_offset;
@@ -88,7 +89,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // (A branch, not a select: without the bit the view behind `count_buf`
     // is a count of four bytes, or the source itself, and is not read here.)
     [branch]
-    if ((has_count & 4u) != 0) {
+    if ((has_count & 8u) != 0) {
         src_at = count_buf.Load(count_offset + id.x * 4u);
     }
     uint dst_at = id.x * stride;
@@ -679,7 +680,7 @@ fn record_gather_as(
     {
         return false;
     }
-    let constants = [kind, stride, records, 0u32, 4u32, 0u32];
+    let constants = [kind, stride, records, 0u32, 8u32, 0u32];
     let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
     let second = [
         uav_barrier(),
