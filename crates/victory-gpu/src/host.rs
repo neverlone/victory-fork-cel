@@ -3701,6 +3701,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::watch::port_guard_line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
