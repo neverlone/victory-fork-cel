@@ -573,11 +573,20 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    // Each save writes the whole library again (262 MB on 2026-11-27), and
+    // a cutscene adds pipelines all the time: at 20 s a run rewrote it a
+    // dozen times, on a QLC drive whose reads then slowed under the writes.
+    // `VICTORY_PIPELINE_SAVE_SECS` (120 unless set; the last save of a run
+    // is made at its end in any case).
+    static EVERY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    let save_every = *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_PIPELINE_SAVE_SECS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120);
+        std::time::Duration::from_secs(secs)
+    });
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        if !now && last.is_some_and(|t| t.elapsed() < save_every) {
             return;
         }
         *last = Some(std::time::Instant::now());

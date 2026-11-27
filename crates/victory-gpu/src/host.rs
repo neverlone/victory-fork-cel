@@ -8835,6 +8835,18 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                let names = crate::draw::counted_shaders();
+                if !names.is_empty() {
+                    let counts: Vec<String> = names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| format!("{n}={}", crate::draw::SHADER_COUNTS[i].swap(0, Ordering::Relaxed)))
+                        .collect();
+                    tracing::info!("draws by shader since the last line (VICTORY_COUNT_SHADERS): {}", counts.join(" "));
+                }
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

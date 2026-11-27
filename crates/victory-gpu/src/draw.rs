@@ -3051,6 +3051,8 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        #[cfg(feature = "diagnostics")]
+        count_shaders(self.pipeline);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -3596,6 +3598,8 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        count_shaders(self.pipeline);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -3813,6 +3817,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        count_shaders(self.pipeline);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -4326,6 +4332,46 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
 /// ([`State::slots_text`]): `VICTORY_LIST_SLOTS`, hash prefixes separated
 /// by commas. None by default.
 #[cfg(feature = "diagnostics")]
+/// `VICTORY_COUNT_SHADERS=<hash prefix>,...` (diagnostics): draws and
+/// dispatches recorded with a pipeline holding one of these shaders are
+/// counted, per name, and the frame-rate line says how many there were
+/// since the last one (to time how long the title draws a stand-in, a
+/// character's low-detail fallback after a cut, before its own shaders).
+#[cfg(feature = "diagnostics")]
+pub(crate) static SHADER_COUNTS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// The prefixes of `VICTORY_COUNT_SHADERS` (at most 8).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn counted_shaders() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_COUNT_SHADERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .take(8)
+            .collect()
+    })
+}
+
+/// Counts one draw of `pipeline` for [`SHADER_COUNTS`].
+#[cfg(feature = "diagnostics")]
+fn count_shaders(pipeline: usize) {
+    let wanted = counted_shaders();
+    if wanted.is_empty() {
+        return;
+    }
+    let Some(p) = crate::pipeline::host_pipeline(pipeline as This) else {
+        return;
+    };
+    for (i, w) in wanted.iter().enumerate() {
+        if p.stages.iter().any(|s| s.shader.hash.starts_with(w.as_str())) {
+            SHADER_COUNTS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 fn list_slots() -> &'static [String] {
     static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
